@@ -132,26 +132,35 @@ def run_layer1_shape_pipeline(market_events: MarketEvents, n_resamples: int = 10
         n_resamples=n_resamples,
     )
 
+    def fit_kernel_on(sub: pd.DataFrame):
+        """Step 4 kernel fit against each bin's ACTUAL mean RVOL (not its
+        decile label) -- the kernel families are defined over RVOL magnitude,
+        e.g. mu ~ 1.5-2.0, and decile labels (1..10) are not that."""
+        bin_stats = sub.groupby("decile").agg(
+            rvol_mean=("rvol", "mean"), target_mean=(value_col, "mean"), target_sem=(value_col, "sem")
+        )
+        bin_stats = bin_stats.dropna()
+        if len(bin_stats) < 3:
+            return None
+        weights = 1.0 / np.maximum(bin_stats["target_sem"].to_numpy() ** 2, 1e-8)
+        return select_kernel(
+            rvol=bin_stats["rvol_mean"].to_numpy(),
+            target=bin_stats["target_mean"].to_numpy(),
+            weights=weights,
+        )
+
     in_sample_binned = events[(events["sample"] == "in_sample")].dropna(subset=["decile"])
     midpoint = in_sample["date"].median()
     first_half = in_sample_binned[in_sample_binned["date"] <= midpoint]
     second_half = in_sample_binned[in_sample_binned["date"] > midpoint]
 
-    def peak_mu(sub: pd.DataFrame) -> float:
-        bin_means = sub.groupby("decile")[value_col].mean().reindex(range(1, N_DECILES + 1))
-        return float(bin_means.idxmax()) if not bin_means.isna().all() else np.nan
+    first_half_fit = fit_kernel_on(first_half)
+    second_half_fit = fit_kernel_on(second_half)
+    mu_first = first_half_fit.params[0] if first_half_fit is not None else np.nan
+    mu_second = second_half_fit.params[0] if second_half_fit is not None else np.nan
+    g2 = g2_time_stability(mu_first, mu_second)
 
-    g2 = g2_time_stability(peak_mu(first_half), peak_mu(second_half))
-
-    kernel_fit = None
-    if g1.passed:
-        bin_stats = events.dropna(subset=["decile"]).groupby("decile")[value_col].agg(["mean", "sem", "count"])
-        weights = 1.0 / np.maximum(bin_stats["sem"].to_numpy() ** 2, 1e-8)
-        kernel_fit = select_kernel(
-            rvol=bin_stats.index.to_numpy(dtype=float),
-            target=bin_stats["mean"].to_numpy(),
-            weights=weights,
-        )
+    kernel_fit = fit_kernel_on(events.dropna(subset=["decile"])) if g1.passed else None
 
     return {"edges": edges, "events": events, "g1": g1, "g2": g2, "kernel_fit": kernel_fit}
 
